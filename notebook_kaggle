@@ -1,0 +1,318 @@
+import os
+from kaggle_secrets import UserSecretsClient
+
+# 1. Extrage cheia din Kaggle Secrets
+user_secrets = UserSecretsClient()
+CDS_KEY = user_secrets.get_secret("CDS_KEY") # Numele dat la Label în pasul 1
+
+# 2. Scrie fișierul de configurare .cdsapirc
+cdsapirc_path = '/root/.cdsapirc'
+
+content = f"""url: https://cds.climate.copernicus.eu/api
+key: {CDS_KEY}
+"""
+
+with open(cdsapirc_path, 'w') as f:
+    f.write(content)
+
+print("Fișierul .cdsapirc a fost creat cu succes folosind Kaggle Secrets!")
+
+#Am rulat local, pentru ca nu am reusit in kaggle:
+
+import pandas as pd
+from datetime import datetime, timedelta
+from tqdm import tqdm
+
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+# Cei 10 senzori veterani din București pentru 2026
+valid_sensors = [
+    (85261, 'sds011'), (39082, 'sds011'), (84029, 'sds011'), 
+    (65256, 'sds011'), (89277, 'sps30'),  (56776, 'sds011'), 
+    (88307, 'sds011'), (88521, 'sps30'),  (94282, 'sps30'), 
+    (87657, 'sds011')
+]
+
+start_date = datetime(2026, 1, 1)
+end_date = datetime(2026, 9, 30)
+date_list = [(start_date + timedelta(days=i)).strftime("%Y-%m-%d") for i in range((end_date - start_date).days + 1)]
+
+print("Extragem și agregăm datele senzorilor din București (Ian-Sep 2026)...")
+aligned_records = []
+
+for s_id, stype in valid_sensors:
+    print(f"Procesăm senzorul {s_id}...")
+    for d in tqdm(date_list):
+        url = f"https://archive.sensor.community/{d}/{d}_{stype}_sensor_{s_id}.csv"
+        try:
+            df = pd.read_csv(url, sep=";", storage_options=HEADERS)
+            
+            if 'P1' in df.columns: df.rename(columns={'P1': 'PM10'}, inplace=True)
+            if 'P2' in df.columns: df.rename(columns={'P2': 'PM2.5'}, inplace=True)
+            
+            # Aliniere: media zilnică a măsurătorilor
+            daily_mean = df[['PM10', 'PM2.5', 'lat', 'lon']].mean().to_dict()
+            daily_mean['sensor_id'] = s_id
+            daily_mean['date'] = d
+            aligned_records.append(daily_mean)
+        except:
+            pass # Ignorăm zilele cu senzorul deconectat
+
+if aligned_records:
+    df_sensors_aligned = pd.DataFrame(aligned_records)
+    df_sensors_aligned = df_sensors_aligned[['date', 'sensor_id', 'PM2.5', 'PM10', 'lat', 'lon']]
+
+!pip install -q cdsapi xarray netcdf4
+
+import cdsapi
+import os
+import xarray as xr
+import pandas as pd
+
+# Configurare client API
+c = cdsapi.Client()
+os.makedirs("data/era5", exist_ok=True)
+
+# Definim strict lunile de iarnă (Ian, Feb) și de vară (Iun, Iul, Aug)
+lunile_tinta = ['01', '02', '06', '07', '08']
+fisiere_nc = []
+
+print("1. Descărcăm datele ERA5 strict pentru iarnă și vară 2026...")
+
+for luna in lunile_tinta:
+    fisier = f"data/era5/era5_bucharest_2026_{luna}.nc"
+    fisiere_nc.append(fisier)
+    
+    if not os.path.exists(fisier):
+        print(f" -> Se descarcă luna {luna}...")
+        try:
+            c.retrieve(
+                'reanalysis-era5-single-levels',
+                {
+                    'product_type': 'reanalysis',
+                    'format': 'netcdf',
+                    'variable': [
+                        '2m_temperature', '10m_u_component_of_wind', 
+                        '10m_v_component_of_wind', '2m_dewpoint_temperature', 
+                        'boundary_layer_height', 'surface_pressure'
+                    ],
+                    'year': ['2026'],
+                    'month': [luna],
+                    'day': [f"{d:02d}" for d in range(1, 32)], # API-ul ignoră zilele inexistente (ex. 30, 31 feb)
+                    'time': [f"{h:02d}:00" for h in range(24)],
+                    'area': [44.55, 25.95, 44.33, 26.25], 
+                },
+                fisier
+            )
+        except Exception as e:
+            print(f"❌ Eroare la luna {luna}: {e}")
+    else:
+        print(f" -> Luna {luna} există deja pe disc.")
+
+print("\n2. Procesăm fișierele și calculăm media zilnică...")
+dfs = []
+
+for fisier in fisiere_nc:
+    if os.path.exists(fisier):
+        ds = xr.open_dataset(fisier)
+        df_luna = ds.to_dataframe().reset_index()
+        
+        df_luna['date'] = df_luna['valid_time'].dt.strftime('%Y-%m-%d')
+        df_luna = df_luna.drop(columns=['valid_time', 'expver'], errors='ignore')
+        
+        df_zilnic = df_luna.groupby('date').mean(numeric_only=True).reset_index()
+        dfs.append(df_zilnic)
+
+if dfs:
+    era5_final = pd.concat(dfs, ignore_index=True)
+    
+    era5_final.rename(columns={
+        't2m': 'temperatura',
+        'u10': 'vant_u',
+        'v10': 'vant_v',
+        'd2m': 'umiditate_punct_roua',
+        'blh': 'boundary_layer_height',
+        'sp':  'presiune_suprafata'
+    }, inplace=True, errors='ignore')
+    
+    if 'temperatura' in era5_final.columns:
+        era5_final['temperatura'] = era5_final['temperatura'] - 273.15
+        
+    salvare = "era5_bucharest_2026_seasons_aligned.csv"
+    era5_final.to_csv(salvare, index=False)
+    print(f"\n✅ SUCCES! Tabelul meteo de vară/iarnă are {len(era5_final)} zile și e salvat în '{salvare}'.")\
+
+import ee
+import pandas as pd
+from datetime import datetime
+from tqdm import tqdm
+
+# ---> 1. PUNE AICI ID-UL TĂU EARTH ENGINE <---
+PROJECT_ID = 'mede-512119'  # ex: 'ee-eliza-licenta'
+
+print("Se inițializează conexiunea cu sateliții Google Earth Engine...")
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("Conexiune stabilită din prima!")
+except Exception as e:
+    print("⚠️ E nevoie de autentificare pentru Earth Engine. Dă click pe linkul generat mai jos:")
+    ee.Authenticate()  
+    ee.Initialize(project=PROJECT_ID)
+
+# 2. Setări Extragere (Bounding Box București)
+geom = ee.Geometry.Rectangle([25.95, 44.33, 26.25, 44.55])
+
+# Generăm lista de zile strict pentru iarnă (Ian-Feb) și vară (Iun-Aug) 2026
+zile_iarna = pd.date_range(start='2026-01-01', end='2026-02-28').strftime('%Y-%m-%d').tolist()
+zile_vara = pd.date_range(start='2026-06-01', end='2026-08-31').strftime('%Y-%m-%d').tolist()
+toate_zilele = zile_iarna + zile_vara
+
+date_satelit = []
+print(f"\nExtragem datele troposferice de NO2 (Sentinel-5P) pentru {len(toate_zilele)} zile...")
+
+for zi in tqdm(toate_zilele):
+    start_date = ee.Date(zi)
+    end_date = start_date.advance(1, 'day')
+    
+    colectie = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_NO2') \
+                 .filterBounds(geom) \
+                 .filterDate(start_date, end_date) \
+                 .select('tropospheric_NO2_column_number_density')
+    
+    try:
+        if colectie.size().getInfo() > 0:
+            imagine_medie = colectie.mean()
+            valoare_medie = imagine_medie.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geom,
+                scale=1113.2, 
+                maxPixels=1e9
+            ).getInfo()
+            
+            no2_val = valoare_medie.get('tropospheric_NO2_column_number_density')
+            if no2_val is not None:
+                date_satelit.append({'date': zi, 'NO2_satelit': no2_val})
+    except:
+        pass 
+
+# 3. Salvare rezultate
+if date_satelit:
+    df_s5p = pd.DataFrame(date_satelit)
+    salvare_s5p = "s5p_bucharest_2026_seasons_aligned.csv"
+    df_s5p.to_csv(salvare_s5p, index=False)
+    print(f"\n✅ SUCCES! Am salvat datele satelitare pentru {len(df_s5p)} zile în '{salvare_s5p}'.")
+else:
+    print("\n❌ Nu s-au putut extrage datele satelitare.")
+
+
+    
+    save_path = "sensors_bucharest_2026_aligned.csv"
+    df_sensors_aligned.to_csv(save_path, index=False)
+    print(f"\n✅ SUCCES MAJOR! S-au salvat {len(df_sensors_aligned)} observații aliniate în '{save_path}'.")
+else:
+    print("\n❌ Eroare la descărcare.")
+
+import pandas as pd
+
+print("1. Încărcăm cele 3 seturi de date...")
+
+# Calea către fișierul de senzori (încărcat ca Dataset în Kaggle)
+cale_senzori = "/kaggle/input/datasets/caceelizaalexandra/sensor-community/sensors_bucharest_2026_aligned.csv" 
+
+# Căile către fișierele meteo și satelit (generate în sesiunea curentă, în /kaggle/working/)
+cale_meteo = "era5_bucharest_2026_seasons_aligned.csv"
+cale_satelit = "s5p_bucharest_2026_seasons_aligned.csv"
+
+try:
+    df_senzori = pd.read_csv(cale_senzori)
+    df_meteo = pd.read_csv(cale_meteo)
+    df_satelit = pd.read_csv(cale_satelit)
+    
+    print("2. Executăm JOIN-ul final pe data calendaristică...")
+    
+    # Primul merge: Senzori + Meteo (păstrează strict intersecția de iarnă/vară)
+    df_final = pd.merge(df_senzori, df_meteo, on='date', how='inner')
+    
+    # Al doilea merge: (Senzori+Meteo) + Satelit
+    df_final = pd.merge(df_final, df_satelit, on='date', how='inner')
+    
+    print("3. Curățăm și uniformizăm datele...")
+    
+    # a. Ștergem coloanele redundante sau inutile
+    coloane_de_sters = ['number', 'latitude', 'longitude']
+    df_final = df_final.drop(columns=coloane_de_sters, errors='ignore')
+    
+    # b. Uniformizăm temperatura (umiditatea punctului de rouă din Kelvin în Celsius)
+    if 'umiditate_punct_roua' in df_final.columns:
+        # Verificăm dacă e în Kelvin (valori mari, pozitive, în mod normal peste 200 K)
+        if df_final['umiditate_punct_roua'].mean() > 200:
+            df_final['umiditate_punct_roua'] = df_final['umiditate_punct_roua'] - 273.15
+            
+    # Rotunjim datele meteo la 4 zecimale pentru a arăta profesional și curat
+    coloane_de_rotunjit = ['temperatura', 'vant_u', 'vant_v', 'umiditate_punct_roua', 'boundary_layer_height']
+    for col in coloane_de_rotunjit:
+        if col in df_final.columns:
+            df_final[col] = df_final[col].round(4)
+            
+    # 4. Curățare și Salvare Matricea X finală
+    salvare_finala = "X_matrix_bucharest_2026_CP1.csv"
+    df_final.to_csv(salvare_finala, index=False)
+    
+    print(f"\n✅ MATRICEA X ESTE GATA, CURĂȚATĂ ȘI UNIFORMIZATĂ! Fișierul '{salvare_finala}' a fost suprascris.")
+    print(f"Număr total de observații aliniate: {len(df_final)}")
+    print(f"Coloanele finale (curățate):\n{df_final.columns.tolist()}")
+
+except FileNotFoundError as e:
+    print(f"\n❌ Eroare: Nu găsesc unul dintre fișiere. Detalii: {e}")
+    print("Asigură-te că fișierul de senzori este încărcat în directorul corect în Kaggle.")
+
+import pandas as pd
+import numpy as np
+
+# 1. Încărcăm tabelul aliniat brut
+df = pd.read_csv('X_matrix_bucharest_2026_CP1_aligned.csv')
+
+# 2. Filtrăm STRICT lunile de sezon cerute de tema U12 (Iarnă: Ian, Feb; Vară: Iun, Iul, Aug)
+df['date_dt'] = pd.to_datetime(df['date'])
+seasonal_months = [1, 2, 6, 7, 8]
+df_clean = df[df['date_dt'].dt.month.isin(seasonal_months)].copy()
+
+# 3. Conversie Dewpoint din Kelvin în grade Celsius
+if 'umiditate_punct_roua' in df_clean.columns:
+    if df_clean['umiditate_punct_roua'].mean() > 200:
+        df_clean['umiditate_punct_roua'] = df_clean['umiditate_punct_roua'] - 273.15
+
+# 4. Calculăm Viteza Vântului (modulul scalar al vântului în m/s)
+if 'vant_u' in df_clean.columns and 'vant_v' in df_clean.columns:
+    df_clean['viteza_vant'] = np.sqrt(df_clean['vant_u']**2 + df_clean['vant_v']**2)
+
+# 5. Corectăm anomalia fizică TROPOMI: trunchiem valorile negative la 0
+if 'NO2_satelit' in df_clean.columns:
+    df_clean['NO2_satelit'] = df_clean['NO2_satelit'].clip(lower=0)
+
+# 6. Eliminăm coloanele parasite / redundante
+cols_to_drop = ['number', 'latitude', 'longitude', 'date_dt']
+df_clean = df_clean.drop(columns=[c for c in cols_to_drop if c in df_clean.columns])
+
+# 7. Reordonăm coloanele logic
+ordered_cols = [
+    'date', 'sensor_id', 'lat', 'lon', 
+    'PM2.5', 'PM10', 
+    'temperatura', 'umiditate_punct_roua', 'viteza_vant', 'vant_u', 'vant_v', 
+    'boundary_layer_height', 'presiune_suprafata', 
+    'NO2_satelit'
+]
+df_clean = df_clean[[c for c in ordered_cols if c in df_clean.columns]]
+
+# 8. Rotunjim datele numerice la 4 zecimale pentru afișare și prezentare
+float_cols = ['PM2.5', 'PM10', 'lat', 'lon', 'temperatura', 'umiditate_punct_roua', 'viteza_vant', 'vant_u', 'vant_v', 'boundary_layer_height', 'presiune_suprafata']
+for col in float_cols:
+    if col in df_clean.columns:
+        df_clean[col] = df_clean[col].round(4)
+
+# 9. Salvăm fișierul final
+salvare_finala = 'X_matrix_bucharest_2026_CP1_FINAL.csv'
+df_clean.to_csv(salvare_finala, index=False)
+
+print(f"✅ SUCCES! Fișierul aliniat final a fost salvat ca '{salvare_finala}'.")
+print(f"Dimensiune finală: {df_clean.shape[0]} rânduri × {df_clean.shape[1]} coloane.")
